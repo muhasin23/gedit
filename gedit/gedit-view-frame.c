@@ -39,6 +39,11 @@
 
 #define FLUSH_TIMEOUT_DURATION 30 /* in seconds */
 
+/* Number of seconds before updating the search when the search entry contains
+ * <= 2 characters.
+ */
+#define UPDATE_SEARCH_TIMEOUT_DURATION 1
+
 #define SEARCH_POPUP_MARGIN 12
 
 typedef enum
@@ -74,6 +79,7 @@ struct _GeditViewFramePrivate
 
 	guint flush_timeout_id;
 	guint idle_update_entry_tag_id;
+	guint update_search_timeout_id;
 	guint remove_entry_tag_timeout_id;
 	gulong view_scroll_event_id;
 	gulong search_entry_focus_out_id;
@@ -133,6 +139,12 @@ gedit_view_frame_dispose (GObject *object)
 	{
 		g_source_remove (frame->priv->idle_update_entry_tag_id);
 		frame->priv->idle_update_entry_tag_id = 0;
+	}
+
+	if (frame->priv->update_search_timeout_id != 0)
+	{
+		g_source_remove (frame->priv->update_search_timeout_id);
+		frame->priv->update_search_timeout_id = 0;
 	}
 
 	if (frame->priv->remove_entry_tag_timeout_id != 0)
@@ -219,6 +231,12 @@ hide_search_widget (GeditViewFrame *frame,
 	{
 		g_source_remove (frame->priv->flush_timeout_id);
 		frame->priv->flush_timeout_id = 0;
+	}
+
+	if (frame->priv->update_search_timeout_id != 0)
+	{
+		g_source_remove (frame->priv->update_search_timeout_id);
+		frame->priv->update_search_timeout_id = 0;
 	}
 
 	gtk_revealer_set_reveal_child (frame->priv->revealer, FALSE);
@@ -380,7 +398,8 @@ start_search (GeditViewFrame *frame)
 
 	search_context = get_search_context (frame);
 
-	if (search_context == NULL)
+	if (search_context == NULL ||
+	    frame->priv->start_mark == NULL)
 	{
 		return;
 	}
@@ -765,9 +784,6 @@ update_search_text (GeditViewFrame *frame)
 {
 	const gchar *entry_text = gtk_entry_get_text (GTK_ENTRY (frame->priv->search_entry));
 
-	g_free (frame->priv->search_text);
-	frame->priv->search_text = g_strdup (entry_text);
-
 	if (gtk_source_search_settings_get_regex_enabled (frame->priv->search_settings))
 	{
 		gtk_source_search_settings_set_search_text (frame->priv->search_settings,
@@ -1150,6 +1166,75 @@ update_goto_line (GeditViewFrame *frame)
 	}
 }
 
+static gboolean
+update_search_timeout_cb (GeditViewFrame *frame)
+{
+	frame->priv->update_search_timeout_id = 0;
+
+	update_search_text (frame);
+	start_search (frame);
+
+	return G_SOURCE_REMOVE;
+}
+
+static void
+disable_search (GeditViewFrame *frame)
+{
+	gtk_source_search_settings_set_search_text (frame->priv->search_settings, NULL);
+
+	set_search_state (frame, SEARCH_STATE_NORMAL);
+
+	if (frame->priv->start_mark != NULL)
+	{
+		GtkTextBuffer *buffer = gtk_text_view_get_buffer (GTK_TEXT_VIEW (frame->priv->view));
+		GtkTextIter start_at;
+
+		gtk_text_buffer_get_iter_at_mark (buffer,
+						  &start_at,
+						  frame->priv->start_mark);
+
+		gtk_text_buffer_select_range (buffer, &start_at, &start_at);
+	}
+}
+
+static void
+update_search (GeditViewFrame *frame)
+{
+	const gchar *entry_text;
+	guint16 chars_count;
+
+	entry_text = gtk_entry_get_text (GTK_ENTRY (frame->priv->search_entry));
+
+	g_free (frame->priv->search_text);
+	frame->priv->search_text = g_strdup (entry_text);
+
+	if (frame->priv->update_search_timeout_id != 0)
+	{
+		g_source_remove (frame->priv->update_search_timeout_id);
+		frame->priv->update_search_timeout_id = 0;
+	}
+
+	chars_count = gtk_entry_get_text_length (GTK_ENTRY (frame->priv->search_entry));
+
+	if (chars_count <= 2)
+	{
+		/* Disable the search during the timeout. Otherwise old
+		 * occurrences can still be highlighted when we delete text from
+		 * the search entry (3 chars -> 2 chars).
+		 */
+		disable_search (frame);
+
+		frame->priv->update_search_timeout_id =
+			g_timeout_add_seconds (UPDATE_SEARCH_TIMEOUT_DURATION,
+					       (GSourceFunc)update_search_timeout_cb,
+					       frame);
+	}
+	else
+	{
+		update_search_timeout_cb (frame);
+	}
+}
+
 static void
 search_entry_changed_cb (GtkEntry       *entry,
 			 GeditViewFrame *frame)
@@ -1158,8 +1243,7 @@ search_entry_changed_cb (GtkEntry       *entry,
 
 	if (frame->priv->search_mode == SEARCH)
 	{
-		update_search_text (frame);
-		start_search (frame);
+		update_search (frame);
 	}
 	else
 	{
